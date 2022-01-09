@@ -5,8 +5,7 @@
 		Welcome to the SSO OAuth plugin! If you're inspecting this code, you're probably looking to
 		hook up NodeBB with your existing OAuth endpoint.
 
-		Step 1: Fill in the "constants" section below with the requisite informaton. Either the "oauth"
-				or "oauth2" section needs to be filled, depending on what you set "type" to.
+		Step 1: Fill in the "constants" section below with the requisite informaton.
 
 		Step 2: Give it a whirl. If you see the congrats message, you're doing well so far!
 
@@ -46,24 +45,18 @@
 	 *   `OAUTH__ID=someoauthid OAUTH__SECRET=youroauthsecret node app.js`
 	 */
 
-	const constants = Object.freeze({
-		type: '',	// Either 'oauth' or 'oauth2'
-		name: '',	// Something unique to your OAuth provider in lowercase, like "github", or "nodebb"
-		oauth: {
-			requestTokenURL: '',
-			accessTokenURL: '',
-			userAuthorizationURL: '',
-			consumerKey: nconf.get('oauth:key'),	// don't change this line
-			consumerSecret: nconf.get('oauth:secret'),	// don't change this line
-		},
-		oauth2: {
-			authorizationURL: '',
-			tokenURL: '',
-			clientID: nconf.get('oauth:id'),	// don't change this line
-			clientSecret: nconf.get('oauth:secret'),	// don't change this line
-		},
-		userRoute: '',	// This is the address to your app's "user profile" API endpoint (expects JSON)
-	});
+	const constants = {
+		name: nconf.get('oauth2:provider'),	// Something unique to your OAuth provider in lowercase, like "github", or "nodebb"
+		authorizationURL: nconf.get('oauth2:authUrl'),
+		tokenURL: nconf.get('oauth2:tokenUrl'),
+		clientID: nconf.get('oauth2:id'),	// don't change this line
+		clientSecret: nconf.get('oauth2:secret'),	// don't change this line
+		userRoute: nconf.get('oauth2:userInfoUrl'),	// This is the address to your app's "user profile" API endpoint (expects JSON)
+		scope: 'profile',
+		adminRole: nconf.get('oauth2:adminRole'),
+	};
+
+	console.log(constants);
 
 	const OAuth = {};
 	let configOk = false;
@@ -72,8 +65,6 @@
 
 	if (!constants.name) {
 		winston.error('[sso-oauth] Please specify a name for your OAuth provider (library.js:32)');
-	} else if (!constants.type || (constants.type !== 'oauth' && constants.type !== 'oauth2')) {
-		winston.error('[sso-oauth] Please specify an OAuth strategy to utilise (library.js:31)');
 	} else if (!constants.userRoute) {
 		winston.error('[sso-oauth] User Route required (library.js:31)');
 	} else {
@@ -82,67 +73,35 @@
 
 	OAuth.getStrategy = function (strategies, callback) {
 		if (configOk) {
-			passportOAuth = require('passport-oauth')[constants.type === 'oauth' ? 'OAuthStrategy' : 'OAuth2Strategy'];
+			passportOAuth = require('passport-oauth')['OAuth2Strategy'];
 
-			if (constants.type === 'oauth') {
-				// OAuth options
-				opts = constants.oauth;
-				opts.callbackURL = nconf.get('url') + '/auth/' + constants.name + '/callback';
+			// OAuth 2 options
+			opts = constants;
+			opts.callbackURL = nconf.get('url') + '/auth/' + constants.name + '/callback';
 
-				passportOAuth.Strategy.prototype.userProfile = function (token, secret, params, done) {
+			passportOAuth.Strategy.prototype.userProfile = function (accessToken, done) {
+				// If your OAuth provider requires the access token to be sent in the query  parameters
+				// instead of the request headers, comment out the next line:
+				this._oauth2._useAuthorizationHeaderForGET = true;
 
-					// If your OAuth provider requires the access token to be sent in the query  parameters
-					// instead of the request headers, comment out the next line:
-					this._oauth._useAuthorizationHeaderForGET = true;
+				this._oauth2.get(constants.userRoute, accessToken, function (err, body/* , res */) {
+					if (err) {
+						return done(err);
+					}
 
-					this._oauth.get(constants.userRoute, token, secret, function (err, body/* , res */) {
-						if (err) {
-							return done(err);
-						}
+					try {
+						var json = JSON.parse(body);
+						OAuth.parseUserReturn(json, function (err, profile) {
+							if (err) return done(err);
+							profile.provider = constants.name;
 
-						try {
-							var json = JSON.parse(body);
-							OAuth.parseUserReturn(json, function (err, profile) {
-								if (err) return done(err);
-								profile.provider = constants.name;
-
-								done(null, profile);
-							});
-						} catch (e) {
-							done(e);
-						}
-					});
-				};
-			} else if (constants.type === 'oauth2') {
-				// OAuth 2 options
-				opts = constants.oauth2;
-				opts.callbackURL = nconf.get('url') + '/auth/' + constants.name + '/callback';
-
-				passportOAuth.Strategy.prototype.userProfile = function (accessToken, done) {
-
-					// If your OAuth provider requires the access token to be sent in the query  parameters
-					// instead of the request headers, comment out the next line:
-					this._oauth2._useAuthorizationHeaderForGET = true;
-
-					this._oauth2.get(constants.userRoute, accessToken, function (err, body/* , res */) {
-						if (err) {
-							return done(err);
-						}
-
-						try {
-							var json = JSON.parse(body);
-							OAuth.parseUserReturn(json, function (err, profile) {
-								if (err) return done(err);
-								profile.provider = constants.name;
-
-								done(null, profile);
-							});
-						} catch (e) {
-							done(e);
-						}
-					});
-				};
-			}
+							done(null, profile);
+						});
+					} catch (e) {
+						done(e);
+					}
+				});
+			};
 
 			opts.passReqToCallback = true;
 
@@ -153,6 +112,14 @@
 					email: profile.emails[0].value,
 					isAdmin: profile.isAdmin,
 				});
+
+
+				if (profile.isAdmin) {
+					await Groups.join('administrators', uid);
+				}
+				else {
+					await Groups.leave('administrators', uid);
+				}
 
 				authenticationController.onSuccessfulLogin(req, user.uid);
 				done(null, user);
@@ -178,19 +145,21 @@
 		// Everything else is optional.
 
 		// Find out what is available by uncommenting this line:
-		// console.log(data);
+		console.log(data);
 
 		var profile = {};
-		profile.id = data.id;
+		profile.id = data.sub;
 		profile.displayName = data.name;
 		profile.emails = [{ value: data.email }];
 
 		// Do you want to automatically make somebody an admin? This line might help you do that...
-		// profile.isAdmin = data.isAdmin ? true : false;
+		if (constants.adminRole && data.roles) {
+			profile.isAdmin = data.roles.includes(constants.adminRole);
+		}
 
 		// Delete or comment out the next TWO (2) lines when you are ready to proceed
-		process.stdout.write('===\nAt this point, you\'ll need to customise the above section to id, displayName, and emails into the "profile" object.\n===');
-		return callback(new Error('Congrats! So far so good -- please see server log for details'));
+		// process.stdout.write('===\nAt this point, you\'ll need to customise the above section to id, displayName, and emails into the "profile" object.\n===');
+		// return callback(new Error('Congrats! So far so good -- please see server log for details'));
 
 		// eslint-disable-next-line
 		callback(null, profile);
@@ -218,10 +187,6 @@
 		// Save provider-specific information to the user
 		await User.setUserField(uid, constants.name + 'Id', payload.oAuthid);
 		await db.setObjectField(constants.name + 'Id:uid', payload.oAuthid, uid);
-
-		if (payload.isAdmin) {
-			await Groups.join('administrators', uid);
-		}
 
 		return {
 			uid: uid,
